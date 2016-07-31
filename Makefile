@@ -1,0 +1,3 @@
+.POSIX:
+
+long-shebang:

@@ -3,6 +3,13 @@ long-shebang
 
 A tool for `#!` scripts with more than one argument.
 
+On [most][1] modern systems, the kernel will only pass one argument to
+a shebang interpreter script. Some tools, like `perl` and `ruby`, work
+around this by parsing the shebang line themselves. `long-shebang` is a
+more general solution: it will parse the *second* line as a shebang
+line, with arbitrary numbers of arguments. As an additional convenience,
+the program to be run can be looked up in `PATH`.
+
 Usage
 ------
 
@@ -22,4 +29,6 @@ The following escapes are recognized in the second `#!` line:
 
 * `\\`: A literal `\`
 * `\n`: A newline
-* `\ `: A space rather than an argument delimiter
+* `\ `(backslash-space): A space rather than an argument delimiter
+
+[1]: http://www.in-ulm.de/~mascheck/various/shebang/

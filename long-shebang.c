@@ -5,6 +5,13 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <unistd.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+
+#ifndef O_CLOEXEC
+#define O_CLOEXEC 0
+#define NEED_FCNTL
+#endif
 
 typedef enum {
   exit_usage = 1,
@@ -15,32 +22,56 @@ typedef enum {
   exit_null = 6,
   exit_unknown_escape = 7,
   exit_exec = 8,
-  exit_no_shebang
+  exit_no_shebang = 9,
+  exit_stat = 10,
+  exit_no_args = 11,
+  exit_bad_script_arg = 12
 } exit_code;
 
-static void handle_eof(const char *script) {
-  if (errno) {
-    fprintf(stderr, "reading from %s: %s\n", script, strerror(errno));
-    exit(exit_reading);
+typedef struct {
+  int fd;
+  char * buf;
+  size_t offset;
+  size_t fill;
+  size_t capacity;
+  char * filename;
+} state;
+
+static void read_more(state * st) {
+  if (st->fill == st->capacity) {
+    st->capacity *= 2;
+    if (st->fill >= st->capacity) {
+      if (st->fill == SIZE_MAX) {
+	fprintf(stderr, "argument buffer requires ridiculous amount of space (did you really hit this code path?)\n");
+	exit(exit_mem);
+      }
+      st->capacity = SIZE_MAX;
+    }
+    st->buf = realloc(st->buf, st->capacity);
+    if (!st->buf) {
+      perror("allocating argument buffer");
+      exit(exit_mem);
+    }
   }
-  fprintf(stderr, "early EOF reading from %s", script);
-  exit(exit_eof);
+
+  ssize_t nread = read(st->fd, st->buf + st->fill, st->capacity - st->fill);
+  if (nread == -1) {
+    fprintf(stderr, "reading from %s: %s\n", st->filename, strerror(errno));
+    exit(exit_reading);
+  } else if (nread == 0) {
+    fprintf(stderr, "unexpected EOF reading from %s\n", st->filename);
+    exit(exit_eof);
+  }
+  st->fill += (size_t) nread;
 }
 
-static void increase_buffer(void ** buf, size_t * sz, size_t el_sz) {
-  if (*sz >= SIZE_MAX / el_sz) {
-    fprintf(stderr, "asking for ridiculously large buffer\n");
-    exit(exit_mem);
-  } else if (SIZE_MAX / 2 * el_sz < *sz) {
-    *sz = SIZE_MAX / el_sz;
-  } else {
-    *sz *= 2;
+static char next_char(state * st) {
+  if (st->offset == st->fill) {
+    st->fill = 0;
+    st->offset = 0;
+    read_more(st);
   }
-  *buf = realloc(*buf, *sz * el_sz);
-  if (!*buf) {
-    perror("increasing buffer size");
-    exit(exit_mem);
-  }
+  return st->buf[st->offset++];
 }
 
 int main(int argc, char ** argv) {
@@ -49,134 +80,111 @@ int main(int argc, char ** argv) {
     return exit_usage;
   }
 
-  FILE * script = fopen(argv[1], "r");
-  if (!script) {
-    fprintf(stderr, "opening %s for reading: %s\n", argv[1], strerror(errno));
+  state st;
+
+  st.filename = argv[1];
+
+  st.fd = open(st.filename, O_RDONLY | O_CLOEXEC);
+  if (st.fd == -1) {
+    fprintf(stderr, "opening %s for reading: %s\n", st.filename, strerror(errno));
     return exit_open_script;
   }
+#ifdef NEED_FCNTL
+  fcntl(st.fd, F_SETFD, fcntl(st.fd, F_GETFD) | FD_CLOEXEC);
+#endif
 
-  /* Randomly chosen starting size for number of args, should probably profile */
-  size_t args_size = 4 * sizeof(char *);
-  /* args[0] always used */
-  size_t args_used = 1;
-  char ** args = malloc(args_size);
-  if (!args) {
-    perror("allocating argument pointers");
-    return exit_mem;
+  struct stat buf;
+  if (fstat(st.fd, &buf) == -1) {
+    fprintf(stderr, "getting file status of %s: %s\n", st.filename, strerror(errno));
+    return exit_stat;
   }
 
-  /* Randomly chosen starting size for the actual strings, should probably profile */
-  size_t args_string_size = 1024;
-  size_t args_string_used = 0;
-  char * args_string = malloc(args_string_size);
-  if (!args_string) {
+  st.capacity = buf.st_blksize;
+  st.fill = 0;
+  st.offset = 0;
+  st.buf = malloc(st.capacity);
+  if (!st.buf) {
     perror("allocating argument buffer");
-    return exit_mem;
+    exit(exit_mem);
   }
 
-  /* Skip real shebang line */
-  errno = 0;
-  while (1) {
-    switch (fgetc(script)) {
-      case EOF:
-        handle_eof(argv[1]);
-      case '\n':
-        goto done_first_line;
-    }
-  }
-done_first_line:
+  /* Skip first line */
+  while (next_char(&st) != '\n');
 
-  switch (fgetc(script)) {
-    case EOF:
-      handle_eof(argv[1]);
-    case '#':
-      break;
-    default:
-      fprintf(stderr, "second line of %s doesn't begin with shebang line\n", argv[1]);
-      return exit_no_shebang;
-  }
-
-  switch (fgetc(script)) {
-    case EOF:
-      handle_eof(argv[1]);
-    case '!':
-      break;
-    default:
-      fprintf(stderr, "second line of %s doesn't begin with shebang line\n", argv[1]);
-      return exit_no_shebang;
+  /* Ensure we start with a shebang */
+  if (next_char(&st) != '#' || next_char(&st) != '!') {
+    fprintf(stderr, "second line of %s doesn't begin with #!\n", st.filename);
+    return exit_no_shebang;
   }
 
   /* Skip leading spaces */
-  while (1) {
-    int res = fgetc(script);
-    switch (res) {
-      case EOF:
-        handle_eof(argv[1]);
-      case ' ':
-        continue;
-      default:
-        ungetc(res, script);
-        break;
-    }
-    break;
-  }
+  while (next_char(&st) == ' ');
 
-  /* Read second line */
-  errno = 0;
-  int done = 0;
-  while (!done) {
-    int res = fgetc(script);
-    switch (res) {
-      case EOF:
-        handle_eof(argv[1]);
-      case '\0':
-        fprintf(stderr, "unexpected null character in long shebang line of %s\n", argv[1]);
-        return exit_null;
-      case '\n':
-        done = 1;
-        if ((args_used + 1) * sizeof(char *) >= args_size)
-          increase_buffer((void**) &args, &args_size, sizeof(char *));
-        args[args_used++] = argv[1];
-	args[args_used++] = NULL;
-	res = '\0';
-	break;
-      case ' ':
-        res = '\0';
-        if (args_used * sizeof(char *) == args_size)
-          increase_buffer((void **) &args, &args_size, sizeof(char *));
-        args[args_used++] = args_string + args_string_used + 1;
-        break;
-      case '\\':
-        switch (fgetc(script)) {
-          case EOF:
-            handle_eof(argv[1]);
-          case '\\':
-            break;
-          case 'n':
-            res = '\n';
-            break;
-          case ' ':
-            res = ' ';
-            break;
-          default:
-            fprintf(stderr, "unknown escape %c in long shebang line of %s\n", res, argv[1]);
-            return exit_unknown_escape;
-        }
-        break;
-    }
-    args_string[args_string_used++] = res;
-    if (args_string_used == args_string_size && !done) {
-      char * old_args_string = args_string;
-      increase_buffer((void **) &args_string, &args_string_size, sizeof(char));
-      if (old_args_string != args_string) {
-        /* Update pointers... */
-        for (size_t i = 1; i < args_used; ++i)
-          args[i] = args_string + (args[i] - old_args_string);
+  st.fill = st.fill - (st.offset - 1);
+  memmove(st.buf, st.buf + st.offset - 1, st.fill);
+  st.offset = 0;
+
+  size_t arg_count = 0;
+  /* Read long shebang line */
+  while (1) {
+    for (; st.offset < st.fill; ++st.offset) {
+      switch (st.buf[st.offset]) {
+        case '\0':
+	  fprintf(stderr, "unexpected null character in long shebang line of %s\n", st.filename);
+	  return exit_null;
+        case '\n':
+	  st.buf[st.offset] = '\0';
+	  arg_count++;
+	  goto args_done;
+        case ' ':
+	  st.buf[st.offset] = '\0';
+	  arg_count++;
+	  /* arg_count overflow would require st.capacity overflow, which we already check for */
+	  break;
+        case '\\':
+	  ++st.offset;
+	  if (st.offset == st.fill)
+	    read_more(&st);
+	  switch (st.buf[st.offset]) {
+	    case 'n':
+	      st.buf[st.offset] = '\n';
+  	    case '\\':
+  	    case ' ':
+	      memmove(st.buf + st.offset - 1, st.buf + st.offset, st.fill - st.offset);
+	      st.fill--;
+	      st.offset--;
+	      break;
+	    default:
+	      fprintf(stderr, "unknown escape %c in long shebang line of %s\n", st.buf[st.offset], st.filename);
+	      return exit_unknown_escape;
+	  }
+	  break;
       }
     }
+    read_more(&st);
+  }
+args_done:
+
+  if (arg_count == 0) {
+    fprintf(stderr, "no arguments in long shebang line of %s\n", st.filename);
+    return exit_no_args;
   }
 
-  args[0] = args_string;
+  char ** args = malloc(sizeof(char**) * (arg_count + 2 /* script, trailing null */));
+  if (!args) {
+    perror("allocating arg pointer buffer");
+    return exit_mem;
+  }
+
+  args[0] = st.buf;
+  for (size_t i = 1; i < arg_count; ++i) {
+    args[i] = args[i-1] + 1;
+    while (*args[i] != '\0')
+      args[i]++;
+    args[i]++;
+  }
+  args[arg_count] = st.filename;
+  args[arg_count + 1] = NULL;
 
   execvp(args[0], args);
   fprintf(stderr, "executing %s: %s\n", args[0], strerror(errno));

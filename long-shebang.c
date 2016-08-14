@@ -25,7 +25,8 @@ typedef enum {
   exit_no_shebang = 9,
   exit_stat = 10,
   exit_no_args = 11,
-  exit_bad_script_arg = 12
+  exit_bad_script_arg = 12,
+  exit_bad_a_escape = 13
 } exit_code;
 
 typedef struct {
@@ -42,8 +43,8 @@ static void read_more(state * st) {
     st->capacity *= 2;
     if (st->fill >= st->capacity) {
       if (st->fill == SIZE_MAX) {
-	fprintf(stderr, "argument buffer requires ridiculous amount of space (did you really hit this code path?)\n");
-	exit(exit_mem);
+        fprintf(stderr, "argument buffer requires ridiculous amount of space (did you really hit this code path?)\n");
+        exit(exit_mem);
       }
       st->capacity = SIZE_MAX;
     }
@@ -124,46 +125,61 @@ int main(int argc, char ** argv) {
   memmove(st.buf, st.buf + st.offset - 1, st.fill);
   st.offset = 0;
 
+  int separate_arg = 0;
   size_t arg_count = 0;
   /* Read long shebang line */
   while (1) {
     for (; st.offset < st.fill; ++st.offset) {
       switch (st.buf[st.offset]) {
         case '\0':
-	  fprintf(stderr, "unexpected null character in long shebang line of %s\n", st.filename);
-	  return exit_null;
+          fprintf(stderr, "unexpected null character in long shebang line of %s\n", st.filename);
+          return exit_null;
         case '\n':
-	  st.buf[st.offset] = '\0';
-	  arg_count++;
-	  goto args_done;
+          st.buf[st.offset] = '\0';
+          arg_count++;
+          goto args_done;
         case ' ':
-	  st.buf[st.offset] = '\0';
-	  arg_count++;
-	  /* arg_count overflow would require st.capacity overflow, which we already check for */
-	  break;
+          st.buf[st.offset] = '\0';
+          arg_count++;
+          /* arg_count overflow would require st.capacity overflow, which we already check for */
+          break;
         case '\\':
-	  ++st.offset;
-	  if (st.offset == st.fill)
-	    read_more(&st);
-	  switch (st.buf[st.offset]) {
-	    case 'n':
-	      st.buf[st.offset] = '\n';
-  	    case '\\':
-  	    case ' ':
-	      memmove(st.buf + st.offset - 1, st.buf + st.offset, st.fill - st.offset);
-	      st.fill--;
-	      st.offset--;
-	      break;
-	    default:
-	      fprintf(stderr, "unknown escape %c in long shebang line of %s\n", st.buf[st.offset], st.filename);
-	      return exit_unknown_escape;
-	  }
-	  break;
+          ++st.offset;
+          if (st.offset == st.fill)
+            read_more(&st);
+          switch (st.buf[st.offset]) {
+            case 'n':
+              st.buf[st.offset] = '\n';
+            case '\\':
+            case ' ':
+              memmove(st.buf + st.offset - 1, st.buf + st.offset, st.fill - st.offset);
+              st.fill--;
+              st.offset--;
+              break;
+            case 'a':
+              if (st.offset == st.fill)
+                read_more(&st);
+              if (st.offset != 1 || st.buf[2] != ' ' || separate_arg) {
+                fprintf(stderr, "\\a escape doesn't appear as the first argument of long shebang line %s\n", st.filename);
+                return exit_bad_a_escape;
+              }
+              if (st.fill == 2)
+                read_more(&st);
+              memmove(st.buf, st.buf + 3, st.fill - 3);
+              st.offset = 0;
+              separate_arg = 1;
+              break;
+            default:
+              fprintf(stderr, "unknown escape %c in long shebang line of %s\n", st.buf[st.offset], st.filename);
+              return exit_unknown_escape;
+          }
+          break;
       }
     }
     read_more(&st);
   }
 args_done:
+  arg_count -= separate_arg;
 
   if (arg_count == 0) {
     fprintf(stderr, "no arguments in long shebang line of %s\n", st.filename);
@@ -177,6 +193,12 @@ args_done:
   }
 
   args[0] = st.buf;
+  if (separate_arg) {
+    while (*args[0] != '\0')
+      args[0]++;
+    args[0]++;
+  }
+
   for (size_t i = 1; i < arg_count; ++i) {
     args[i] = args[i-1] + 1;
     while (*args[i] != '\0')
@@ -186,7 +208,7 @@ args_done:
   args[arg_count] = st.filename;
   args[arg_count + 1] = NULL;
 
-  execvp(args[0], args);
+  execvp(st.buf, args);
   fprintf(stderr, "executing %s: %s\n", args[0], strerror(errno));
   return exit_exec;
 }

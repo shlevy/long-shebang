@@ -76,8 +76,8 @@ static char next_char(state * st) {
 }
 
 int main(int argc, char ** argv) {
-  if (argc != 2) {
-    fprintf(stderr, "Usage (meant for shebang only): %s SCRIPT\n", argv[0]);
+  if (argc < 2) {
+    fprintf(stderr, "%s used outside of a shebang\n", argv[0]);
     return exit_usage;
   }
 
@@ -186,7 +186,7 @@ args_done:
     return exit_no_args;
   }
 
-  char ** args = malloc(sizeof(char**) * (arg_count + 2 /* script, trailing null */));
+  char ** args = malloc(sizeof(char**) * (arg_count + argc));
   if (!args) {
     perror("allocating arg pointer buffer");
     return exit_mem;
@@ -205,8 +205,9 @@ args_done:
       args[i]++;
     args[i]++;
   }
-  args[arg_count] = st.filename;
-  args[arg_count + 1] = NULL;
+  for (size_t i = arg_count; i < arg_count + argc; ++i) {
+    args[i] = argv[i + 1 - arg_count];
+  }
 
   execvp(st.buf, args);
   fprintf(stderr, "executing %s: %s\n", args[0], strerror(errno));
